@@ -30,9 +30,12 @@
 #include "qemu/bswap.h"
 #include "dsp_cpu.h"
 
-#define TRACE_DSP_DISASM 0
-#define TRACE_DSP_DISASM_REG 0
-#define TRACE_DSP_DISASM_MEM 0
+#define TRACEME 0 //(!dsp->is_gp)
+
+#define TRACE_DSP_DISASM 0 //(dsp->is_gp && start_tracing) //TRACEME
+
+#define TRACE_DSP_DISASM_REG TRACEME
+#define TRACE_DSP_DISASM_MEM TRACEME
 
 #define DPRINTF(s, ...) printf(s, ## __VA_ARGS__)
 
@@ -284,7 +287,7 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "0000101111DDDDDD001bbbbb", "jsset #n, S, xxxx", dis_jsset_reg, emu_jsset_reg },
     { "0000010011000RRR000ddddd", "lra Rn, D", NULL, NULL },
     { "0000010001000000010ddddd", "lra xxxx, D", NULL, NULL },
-    { "000011000001111010iiiiiD", "lsl #ii, D", NULL, NULL },
+    { "000011000001111010iiiiiD", "lsl #ii, D", dis_lsl_imm, emu_lsl_imm },
     { "00001100000111100001sssD", "lsl S, D", NULL, NULL },
     { "000011000001111011iiiiiD", "lsr #ii, D", NULL, NULL },
     { "00001100000111100011sssD", "lsr S, D", NULL, NULL },
@@ -422,21 +425,46 @@ void dsp56k_reset_cpu(dsp_core_t* dsp)
     dsp->disasm_prev_inst_pc = 0xFFFFFFFF;
 }
 
-static OpcodeEntry lookup_opcode(uint32_t op) {
-    OpcodeEntry r = {0};
+static const OpcodeEntry *lookup_opcode_slow(uint32_t op) {
     int i;
     for (i=0; i<ARRAYSIZE(nonparallel_opcodes); i++) {
         if ((op & nonparallel_matches[i][0]) == nonparallel_matches[i][1]) {
             if (nonparallel_opcodes[i].match_func 
                 && !nonparallel_opcodes[i].match_func(op)) continue;
-            if (r.template != NULL) {
-                printf("qqq %x %s\n", op, r.template);
-            }
-            assert(r.template == NULL);
-            r = nonparallel_opcodes[i];
+            
+            // if (r.template != NULL) {
+            //     printf("qqq %x %s\n", op, r.template);
+            // }
+            // assert(r.template == NULL);
+            // r = nonparallel_opcodes[i];
+            // return r;
+            return &nonparallel_opcodes[i];
         }
     }
-    return r;
+
+    fprintf(stderr, "op = %08x\n", op);
+    assert(0);
+    // return r;
+    return NULL;
+}
+
+static const OpcodeEntry *lookup_opcode(uint32_t op) {
+    static struct opcache_entry {
+        uint32_t op;
+        const OpcodeEntry *entry;
+    } opcache[256];
+
+    uint8_t tag =
+        ((op >> 24) & 0xff) ^
+        ((op >> 16) & 0xff) ^
+        ((op >>  8) & 0xff) ^
+        ((op >>  0) & 0xff);
+    if (opcache[tag].op != op || opcache[tag].entry == NULL) {
+        opcache[tag].op = op;
+        opcache[tag].entry = lookup_opcode_slow(op);
+    }
+
+    return opcache[tag].entry;
 }
 
 static uint16_t disasm_instruction(dsp_core_t* dsp, dsp_trace_disasm_t mode)
@@ -461,12 +489,12 @@ static uint16_t disasm_instruction(dsp_core_t* dsp, dsp_trace_disasm_t mode)
     dsp->disasm_parallelmove_name[0] = 0;
 
     if (dsp->disasm_cur_inst < 0x100000) {
-        const OpcodeEntry op = lookup_opcode(dsp->disasm_cur_inst);
-        if (op.template) {
-            if (op.dis_func) {
-                op.dis_func(dsp);
+        const OpcodeEntry *op = lookup_opcode(dsp->disasm_cur_inst);
+        if (op->template) {
+            if (op->dis_func) {
+                op->dis_func(dsp);
             } else {
-                sprintf(dsp->disasm_str_instr, "%s", op.name);
+                sprintf(dsp->disasm_str_instr, "%s", op->name);
             }
         } else {
             dis_undefined(dsp);
@@ -659,16 +687,20 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
             }
         }
     }
-            
+
     if (dsp->cur_inst < 0x100000) {
-        const OpcodeEntry op = lookup_opcode(dsp->cur_inst);
-        if (op.emu_func) {
-            op.emu_func(dsp);
+        const OpcodeEntry *op = dsp->pram_opcache[dsp->pc];
+        if (op == NULL) {
+            op = lookup_opcode(dsp->cur_inst);
+            dsp->pram_opcache[dsp->pc] = op;
+        }
+        if (op->emu_func) {
+            op->emu_func(dsp);
         } else {
-            printf("%x - %s\n", dsp->cur_inst, op.name);
+            printf("%x - %s\n", dsp->cur_inst, op->name);
             emu_undefined(dsp);
         }
-    } else {
+    } else {        
         /* Do parallel move read */
         opcodes_parmove[(dsp->cur_inst>>20) & BITMASK(4)](dsp);
     }
@@ -703,6 +735,9 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
 
     /* Process Interrupts */
     dsp_postexecute_interrupts(dsp);
+
+
+    dsp->num_inst += dsp->instr_cycle;
 
 #ifdef DSP_COUNT_IPS
     ++dsp->num_inst;
@@ -959,8 +994,14 @@ static uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
 {
     assert((address & 0xFF000000) == 0);
     assert(address < DSP_PRAM_SIZE);
-    uint32_t r = ldl_le_p(&dsp->pram[address]);
-    assert((r & 0xFF000000) == 0);
+    // uint32_t r = ldl_le_p(&dsp->pram[address]);
+    uint32_t r = dsp->pram[address];
+
+    // if (r & 0xFF000000) {
+        // fprintf(stderr, "warning: reading garbage from program memory [%08x] = %08x\n", address, r);
+        r &= 0x00FFFFFF;
+    // }
+    // assert((r & 0xFF000000) == 0);
     return r;
 }
 
@@ -974,9 +1015,17 @@ uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
             return dsp->read_peripheral(dsp, address);
         } else if (address >= DSP_MIXBUFFER_BASE && address < DSP_MIXBUFFER_BASE+DSP_MIXBUFFER_SIZE) {
             return dsp->mixbuffer[address-DSP_MIXBUFFER_BASE];
+        } else if (address >= 0xc00 && address < 0xc00+DSP_MIXBUFFER_SIZE) {
+            return dsp->mixbuffer[address-0xc00];
         } else {
-            assert(address < DSP_XRAM_SIZE);
+            // fprintf(stderr, "%x\n", address);
+            // assert(address < DSP_XRAM_SIZE);
+            if (address < DSP_XRAM_SIZE)
             return dsp->xram[address];
+            else {
+                // fprintf(stderr, "Out of bounds read at %x!\n", address);
+                return 0x00FFFFFF; // FIXME: What does the DSP actually do in this case?
+            }
         }
     } else if (space == DSP_SPACE_Y) {
         assert(address < DSP_YRAM_SIZE);
@@ -1002,8 +1051,8 @@ void dsp56k_write_memory(dsp_core_t* dsp, int space, uint32_t address, uint32_t 
 
 static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint32_t value)
 {
-    assert((value & 0xFF000000) == 0);
-    assert((address & 0xFF000000) == 0);
+    // assert((value & 0xFF000000) == 0);
+    // assert((address & 0xFF000000) == 0);
 
     if (space == DSP_SPACE_X) {
         if (address >= DSP_PERIPH_BASE) {
@@ -1012,6 +1061,8 @@ static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint3
             return;
         } else if (address >= DSP_MIXBUFFER_BASE && address < DSP_MIXBUFFER_BASE+DSP_MIXBUFFER_SIZE) {
             dsp->mixbuffer[address-DSP_MIXBUFFER_BASE] = value;
+        } else if (address >= 0xc00 && address < 0xc00+DSP_MIXBUFFER_SIZE) {
+            dsp->mixbuffer[address-0xc00] = value;
         } else {
             assert(address < DSP_XRAM_SIZE);
             dsp->xram[address] = value;
@@ -1020,8 +1071,12 @@ static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint3
         assert(address < DSP_YRAM_SIZE);
         dsp->yram[address] = value;
     } else if (space == DSP_SPACE_P) {
-        assert(address < DSP_PRAM_SIZE);
-        stl_le_p(&dsp->pram[address], value);
+        // if (dsp->is_gp)
+        // fprintf(stderr, "[%s] P write @ %x = %x\n", dsp->is_gp ? "GP" : "EP", address, value);
+        // assert(address < DSP_PRAM_SIZE);
+        // stl_le_p(&dsp->pram[address], value);
+        dsp->pram[address] = value;
+        dsp->pram_opcache[address] = NULL;
     } else {
         assert(false);
     }

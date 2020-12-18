@@ -48,6 +48,7 @@ extern "C" {
 #include "qemu-common.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/runstate.h"
+#include "hw/xbox/mcpx/apu_debug.h"
 
 #undef typename
 #undef atomic_fetch_add
@@ -550,6 +551,7 @@ private:
     char eeprom_path[MAX_STRING_LEN];
     int  memory_idx;
     bool short_animation;
+    bool use_dsp;
 
 public:
     SettingsWindow()
@@ -564,6 +566,7 @@ public:
         eeprom_path[0] = '\0';
         memory_idx = 0;
         short_animation = false;
+        use_dsp = true;
     }
     
     ~SettingsWindow()
@@ -602,6 +605,9 @@ public:
         xemu_settings_get_bool(XEMU_SETTINGS_SYSTEM_SHORTANIM, &tmp_int);
         short_animation = !!tmp_int;
 
+        xemu_settings_get_bool(XEMU_SETTINGS_AUDIO_USE_DSP, &tmp_int);
+        use_dsp = !!tmp_int;
+
         dirty = false;
     }
 
@@ -613,6 +619,7 @@ public:
         xemu_settings_set_string(XEMU_SETTINGS_SYSTEM_EEPROM_PATH, eeprom_path);
         xemu_settings_set_int(XEMU_SETTINGS_SYSTEM_MEMORY, 64+memory_idx*64);
         xemu_settings_set_bool(XEMU_SETTINGS_SYSTEM_SHORTANIM, short_animation);
+        xemu_settings_set_bool(XEMU_SETTINGS_AUDIO_USE_DSP, use_dsp);
         xemu_settings_save();
         xemu_queue_notification("Settings saved! Restart to apply updates.");
         pending_restart = true;
@@ -694,6 +701,17 @@ public:
         if (ImGui::Checkbox("Skip startup animation", &short_animation)) {
             dirty = true;
         }
+        ImGui::NextColumn();
+
+        ImGui::Dummy(ImVec2(0,0));
+        ImGui::NextColumn();
+        if (ImGui::Checkbox("Enable full audio processing (experimental)", &use_dsp)) {
+            dirty = true;
+        }
+        ImGui::SameLine();
+        HelpMarker("Enable for more accurate audio, disable if the system is\n"
+                   "unable to process in real time or if there are apparent\n"
+                   "issues");
         ImGui::NextColumn();
 
         ImGui::Columns(1);
@@ -1154,7 +1172,204 @@ public:
     }
 };
 
+#include <math.h>
+
+float mix(float a, float b, float t)
+{
+    return a*(1.0-t) + (b-a)*t;
+}
+
+class DebugApuWindow
+{
+public:
+    bool is_open;
+
+    DebugApuWindow()
+    {
+        is_open = false;
+    }
+
+    ~DebugApuWindow()
+    {
+    }
+
+    void Draw()
+    {
+        if (!is_open) return;
+
+        ImGui::SetNextWindowContentSize(ImVec2(600.0f*g_ui_scale, 0.0f));
+        if (!ImGui::Begin("Audio Debug", &is_open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::End();
+            return;
+        }
+
+        const struct McpxApuDebug *dbg = mcpx_apu_get_debug_info();
+
+
+        ImGui::Columns(2, "", false);
+        int now = SDL_GetTicks() % 1000;
+        float t = now/1000.0f;
+        float freq = 1;
+        float v = fabs(sin(M_PI*t*freq));
+        float c_active = mix(0.4, 0.97, v);
+        float c_inactive = 0.2f;
+
+        int voice_monitor = -1;
+        int voice_info = -1;
+        int voice_mute = -1;
+
+        // Color buttons, demonstrate using PushID() to add unique identifier in the ID stack, and changing style.
+        ImGui::PushFont(g_fixed_width_font);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
+        for (int i = 0; i < 256; i++)
+        {
+            if (i % 16) {
+                ImGui::SameLine();
+            }
+
+            float c, s, h;
+            h = 0.6;
+            if (dbg->vp.v[i].active) {
+                if (dbg->vp.v[i].paused) {
+                    c = c_inactive;
+                    s = 0.4;
+                } else {
+                    c = c_active;
+                    s = 0.7;
+                }
+                if (mcpx_apu_debug_is_muted(i)) {
+                    h = 1.0;
+                }
+            } else {
+                c = c_inactive;
+                s = 0;
+            }
+
+            ImGui::PushID(i);
+            ImGui::PushStyleColor(ImGuiCol_Button, (ImVec4)ImColor::HSV(h, s, c));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, (ImVec4)ImColor::HSV(h, s, 0.8));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, (ImVec4)ImColor::HSV(h, 0.8f, 1.0));
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%02x", i);
+            ImGui::Button(buf);
+            if (/*dbg->vp.v[i].active &&*/ ImGui::IsItemHovered()) {
+                voice_monitor = i;
+                voice_info = i;
+            }
+            if (ImGui::IsItemClicked(1)) {
+                voice_mute = i;
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::PopID();
+        }
+        ImGui::PopStyleVar(3);
+        ImGui::PopFont();
+
+        if (voice_info >= 0) {
+            const struct McpxApuDebugVoice *voice = &dbg->vp.v[voice_info];
+            ImGui::BeginTooltip();
+            bool is_paused = voice->paused;
+            ImGui::Text("Voice 0x%x/%d %s", voice_info, voice_info, is_paused ? "(Paused)" : "");
+            ImGui::SameLine();
+            ImGui::Text(voice->stereo ? "Stereo" : "Mono");
+
+            ImGui::Separator();
+            ImGui::PushFont(g_fixed_width_font);
+
+            const char *noyes[2] = { "NO", "YES" };
+            ImGui::Text("Stream: %-3s  Loop: %-3s",
+                noyes[voice->stream], noyes[voice->loop]);
+            ImGui::Text("Persist: %-3s Multipass: %-3s",
+                noyes[voice->persist], noyes[voice->multipass]);
+
+            const char *cs[4] = { "1 byte", "2 bytes", "ADPCM", "4 bytes" };
+            const char *ss[4] = {
+                "Unsigned 8b PCM",
+                "Signed 16b PCM",
+                "Signed 24b PCM",
+                "Signed 32b PCM"
+            };
+
+            assert(voice->container_size < 4);
+            assert(voice->sample_size < 4);
+            ImGui::Text("Container Size: %s, Sample Size: %s, Samples per Block: %d",
+                cs[voice->container_size], ss[voice->sample_size], voice->samples_per_block);
+            ImGui::Text("Rate: %f (%d Hz)", voice->rate, (int)(48000.0/voice->rate));
+            ImGui::Text("EBO=%d CBO=%d LBO=%d BA=%d",
+                voice->ebo, voice->cbo, voice->lbo, voice->ba);
+            ImGui::Text("Mix: ");
+            for (int i = 0; i < 8; i++) {
+                if (i == 4) ImGui::Text("     ");
+                ImGui::SameLine();
+                char buf[64];
+                if (voice->vol[i] == 0xFFF) {
+                    snprintf(buf, sizeof(buf),
+                        "Bin %2d (MUTE) ", voice->bin[i]);
+                } else {
+                    snprintf(buf, sizeof(buf),
+                        "Bin %2d (-%.3f) ", voice->bin[i],
+                        (float)((voice->vol[i] >> 6) & 0x3f) +
+                        (float)((voice->vol[i] >> 0) & 0x3f) / 64.0);
+                }
+                ImGui::Text("%-17s", buf);
+            }
+            ImGui::PopFont();
+            ImGui::EndTooltip();  
+        }
+
+        if (voice_monitor >= 0) {
+            mcpx_apu_debug_isolate_voice(voice_monitor);
+        } else {
+            mcpx_apu_debug_clear_isolations();
+        }
+        if (voice_mute >= 0) {
+            mcpx_apu_debug_toggle_mute(voice_mute);
+        }
+
+        ImGui::SameLine();
+        ImGui::SetColumnWidth(0, ImGui::GetCursorPosX());
+        ImGui::NextColumn();
+
+        ImGui::PushFont(g_fixed_width_font);
+        ImGui::Text("Frames:      %04d", dbg->frames_processed);
+        ImGui::Text("GP Cycles:   %04d", dbg->gp.cycles);
+        ImGui::Text("EP Cycles:   %04d", dbg->ep.cycles);
+        bool color = (dbg->utilization > 0.9);
+        if (color) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0,0,1));
+        ImGui::Text("Utilization: %.2f%%", (dbg->utilization*100));
+        if (color) ImGui::PopStyleColor();
+        ImGui::PopFont();
+
+        ImGui::Separator();
+
+        static int mon = 0;
+        mon = mcpx_apu_debug_get_monitor();
+        if (ImGui::Combo("Monitor", &mon, "AC97\0VP Only\0GP Only\0EP Only\0GP/EP if enabled\0")) {
+            mcpx_apu_debug_set_monitor(mon);
+        }
+
+        static bool gp_realtime;
+        gp_realtime = dbg->gp_realtime;
+        if (ImGui::Checkbox("GP Realtime\n", &gp_realtime)) {
+            mcpx_apu_debug_set_gp_realtime_enabled(gp_realtime);
+        }
+
+        static bool ep_realtime;
+        ep_realtime = dbg->ep_realtime;
+        if (ImGui::Checkbox("EP Realtime\n", &ep_realtime)) {
+            mcpx_apu_debug_set_ep_realtime_enabled(ep_realtime);
+        }
+
+        ImGui::Columns(1);
+        ImGui::End();
+    }
+};
+
+
 static MonitorWindow monitor_window;
+static DebugApuWindow apu_window;
 static InputWindow input_window;
 static NetworkWindow network_window;
 static AboutWindow about_window;
@@ -1385,6 +1600,7 @@ static void ShowMainMenu()
         if (ImGui::BeginMenu("Debug"))
         {
             ImGui::MenuItem("Monitor", NULL, &monitor_window.is_open);
+            ImGui::MenuItem("Audio", NULL, &apu_window.is_open);
             ImGui::EndMenu();
         }
 
@@ -1670,6 +1886,7 @@ void xemu_hud_render(void)
     input_window.Draw();
     settings_window.Draw();
     monitor_window.Draw();
+    apu_window.Draw();
     about_window.Draw();
     network_window.Draw();
     compatibility_reporter_window.Draw();
